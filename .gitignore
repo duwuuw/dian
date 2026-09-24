@@ -1,0 +1,26 @@
+# Datasets and generated training/inference artifacts
+**/data/
+**/runs/
+**/pred*/
+**/smoke/
+level4/splits.json
+level4/AGENT.md
+
+# Model checkpoints and exported weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Python caches and virtual environments
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
