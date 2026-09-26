@@ -38,8 +38,7 @@ def load_model(ckpt: str, device):
     m = build_model(a.get("arch", "unet"), 3, a.get("base_ch", 32), a.get("depth", 4),
                     not a.get("no_residual", False), a.get("attn", False),
                     dim=a.get("dim", 256), blocks=a.get("blocks", 6),
-                    heads=a.get("heads", 8),
-                    rope=not a.get("no_rope", False)).to(device)
+                    heads=a.get("heads", 8)).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
     print(f"[模型] {ckpt} | step={ck.get('step')} | arch={a.get('arch', 'unet')} "

@@ -79,7 +79,6 @@ class _ListDS(Dataset):
 # ================================================================ 曲线
 class Curves:
     FIELDS = ["step", "epoch", "lr", "loss", "l1", "mse", "ssim_loss", "edge", "ghost_loss", "hf_loss",
-              "vgg_loss",
               "val_loss", "psnr", "ssim", "ink_err", "bg_err", "ghost", "ghost_keep",
               "sec_per_step", "elapsed_min", "cost_yuan"]
 
@@ -188,8 +187,6 @@ def parse_args():
     p.add_argument("--dim", type=int, default=256, help="Transformer 隐藏维度")
     p.add_argument("--blocks", type=int, default=6, help="Transformer block 数")
     p.add_argument("--heads", type=int, default=8)
-    p.add_argument("--no_rope", action="store_true",
-                   help="DiT 关闭 RoPE，退回可学习位置编码+推理插值（消融用；默认开 RoPE）")
     # 损失
     p.add_argument("--w_l1", type=float, default=1.0)
     p.add_argument("--w_mse", type=float, default=0.0)
@@ -202,9 +199,6 @@ def parse_args():
                    help="灰印子项权重：惩罚掩码内输出的残留笔画状暗结构。默认 0=旧行为")
     p.add_argument("--w_hf", type=float, default=0.0,
                    help="高频细节项权重：带通信号的有符号 L1，保浅色细线/表格线。默认 0=旧行为")
-    p.add_argument("--w_vgg", type=float, default=0.0,
-                   help="VGG16 浅层(relu1_2/relu2_2)特征 L1 感知损失权重。"
-                        "权重走缓存，不联网不新增依赖。默认 0=不启用")
     p.add_argument("--ghost_warmup", type=int, default=0,
                    help="前 N 步把 ghost 权重从 0 线性升到 --w_ghost，让占 71%% 损失的光照"
                         "归一先收敛，再逼模型彻底擦除。0=不预热（立即全权重）")
@@ -245,7 +239,8 @@ def replot(run_dir: Path, price: float) -> None:
     cv = Curves(run_dir, price, "")
     with open(run_dir / "log.csv", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            cv.add({k: (v if k in ("step", "epoch") else float(v)) for k, v in row.items()})
+            cv.add({k: (int(float(v)) if k in ("step", "epoch") else float(v))
+                    for k, v in row.items()})
     cv.plot(f"U-Net handwriting removal | {run_dir.name}")
     print(f"[重绘] {cv.png}  ({len(cv.rows)} 个评估点)")
 
@@ -269,8 +264,14 @@ def main():
         raise SystemExit("训练集为空")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    name = f"{stamp}-{a.tag}" if a.tag else stamp
-    out = Path(a.out_root) / name
+    if a.resume:
+        # 续训直接写回原 run 目录：log.csv / curves.png / cost.json 全程连续，
+        # 费用接着旧账累计，不用事后手工对账
+        out = Path(a.resume).parent
+        name = out.name
+    else:
+        name = f"{stamp}-{a.tag}" if a.tag else stamp
+        out = Path(a.out_root) / name
 
     ep = a.eval_patch or a.patch
     tr_ds = PairedDataset(splits["train"], patch=a.patch, train=True, augment=DocAugment(),
@@ -288,33 +289,48 @@ def main():
           f"patch={a.patch}/{ep}  downscale=1/{a.downscale}  workers={nw}")
 
     model = build_model(a.arch, 3, a.base_ch, a.depth, not a.no_residual, a.attn,
-                        dim=a.dim, blocks=a.blocks, heads=a.heads,
-                        rope=not a.no_rope).to(device)
+                        dim=a.dim, blocks=a.blocks, heads=a.heads).to(device)
     crit = RestorationLoss(a.w_l1, a.w_mse, a.w_ssim, a.w_edge, a.mask_weight, a.mask_tau,
-                           mask_white=a.mask_white, w_ghost=a.w_ghost, w_hf=a.w_hf,
-                           w_vgg=a.w_vgg).to(device)
+                           mask_white=a.mask_white, w_ghost=a.w_ghost, w_hf=a.w_hf).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
 
     start, best_p, best_s, best_ink, best_ink_step = 0, -1e9, -1e9, 1e9, 0
+    base_seconds, rows_prev = 0.0, []
     if a.resume and Path(a.resume).exists():
         ck = torch.load(a.resume, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         start, best_p, best_s = ck.get("step", 0), ck.get("best_psnr", -1e9), ck.get("best_ssim", -1e9)
-        best_ink = ck.get("best_ink_err", 1e9)
-        print(f"[恢复] {a.resume} step={start}")
+        # last.pth 里不含 best_ink 状态，从同目录的 best_ink.pth 恢复——
+        # 否则续训后的第一次评估必然用一个更差的 ink_err 覆盖真正的最优权重
+        if (out / "best_ink.pth").exists():
+            bik = torch.load(out / "best_ink.pth", map_location="cpu", weights_only=False)
+            best_ink, best_ink_step = bik.get("best_ink_err", 1e9), bik.get("step", 0)
+        print(f"[恢复] {a.resume} step={start} best_PSNR={best_p:.2f} best_ink_err={best_ink:.4f}")
+        if (out / "log.csv").exists():          # 旧评估点接回来，曲线才是连续的
+            with open(out / "log.csv", newline="", encoding="utf-8") as f:
+                rows_prev = [{k: (int(float(v)) if k in ("step", "epoch") else float(v))
+                              for k, v in r.items()} for r in csv.DictReader(f)]
+        if (out / "cost.json").exists():        # 费用接着旧账记
+            base_seconds = json.loads((out / "cost.json").read_text(encoding="utf-8")).get(
+                "total_seconds", 0.0)
 
     gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
     print(f"[模型] {a.arch} base={a.base_ch} depth={a.depth} residual={not a.no_residual} "
           f"attn={a.attn} | {model.n_params()/1e6:.3f} M 参数 | {gpu} | torch {torch.__version__}")
     (out).mkdir(parents=True, exist_ok=True)
-    (out / "run_info.json").write_text(json.dumps(
-        {"tag": a.tag, "args": vars(a), "gpu": gpu, "params_M": model.n_params() / 1e6,
-         "torch": torch.__version__, "python": platform.python_version(),
-         "started_at": stamp, "splits": {k: len(v) for k, v in splits.items()}},
-        ensure_ascii=False, indent=2), encoding="utf-8")
+    info = {"tag": a.tag, "args": vars(a), "gpu": gpu, "params_M": model.n_params() / 1e6,
+            "torch": torch.__version__, "python": platform.python_version(),
+            "started_at": stamp, "splits": {k: len(v) for k, v in splits.items()}}
+    if a.resume and (out / "run_info.json").exists():
+        info["started_at"] = json.loads((out / "run_info.json").read_text(encoding="utf-8")).get(
+            "started_at", stamp)
+        info["resumed_at"] = stamp
+    (out / "run_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
     cv = Curves(out, a.price_per_hour, a.price_note)
-    t0 = time.time()
+    for r in rows_prev:
+        cv.add(r)
+    t0 = time.time() - base_seconds
     step, epoch, ema, done = start, 0, None, False
     step_t = time.time()
     print(f"[输出] {out}\n[开始] max_steps={a.max_steps} eval_every={a.eval_every} "
@@ -371,7 +387,6 @@ def main():
                         "val_loss": m["val_loss"], "l1": float(ld["l1"]), "mse": float(ld["mse"]),
                         "ssim_loss": float(ld["ssim_loss"]), "edge": float(ld["edge"]),
                         "ghost_loss": float(ld["ghost"]), "hf_loss": float(ld["hf"]),
-                        "vgg_loss": float(ld["vgg"]),
                         "psnr": m["psnr"], "ssim": m["ssim"], "sec_per_step": dt,
                         "elapsed_min": (now - t0) / 60, "cost_yuan": el_h * a.price_per_hour,
                         **{k: m[k] for k in INK_KEYS}})

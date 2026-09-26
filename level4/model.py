@@ -147,7 +147,7 @@ class DiTRestore(nn.Module):
 
     为什么不是真·DiT：从零训练一个扩散模型在 30 元预算内不可能（小图也要
     几百 GPU·小时）。这里保留 DiT 的核心结构（patch 化 token + 全局自注意力 +
-    可学习位置编码），但把输出头改成直接预测残差，因此单步就能出结果，
+    2D RoPE 位置编码），但把输出头改成直接预测残差，因此单步就能出结果，
     训练成本与 U-Net 同量级，可以直接对比。
 
     为什么保留全分辨率 CNN 分支：纯 patch-level 的 ViT 在 /4 分辨率上做注意力，
@@ -156,17 +156,12 @@ class DiTRestore(nn.Module):
     这也是 NAFNet/Restormer 一类修复网络的通行做法。
     """
 
-    def __init__(self, ch=3, base=32, dim=256, blocks=6, heads=8, residual=True,
-                 pe_grid=64, rope=True):
+    def __init__(self, ch=3, base=32, dim=256, blocks=6, heads=8, residual=True):
         super().__init__()
-        self.residual, self.rope = residual, rope
+        self.residual = residual
         self.stem = _DoubleConv(ch, base)                                   # /1
         self.d1 = nn.Sequential(nn.MaxPool2d(2), _DoubleConv(base, base * 2))   # /2
         self.d2 = nn.Sequential(nn.MaxPool2d(2), nn.Conv2d(base * 2, dim, 1))   # /4
-        if not rope:                        # 消融用：旧的"可学习位置编码 + 推理时插值"
-            assert dim % heads == 0 and (dim // heads) % 4 == 0
-            self.pe = nn.Parameter(torch.zeros(1, dim, pe_grid, pe_grid))
-            nn.init.trunc_normal_(self.pe, std=0.02)
         self._rcache = {}
         self.blocks = nn.ModuleList([_Block(dim, heads) for _ in range(blocks)])
         self.norm = nn.LayerNorm(dim)
@@ -185,24 +180,16 @@ class DiTRestore(nn.Module):
         z = self.d2(s2)                         # /4, dim
         B, C, hz, wz = z.shape
 
-        if self.rope:
-            key = (hz, wz, z.device)
-            r = self._rcache.get(key)
-            if r is None:                        # 按 (h,w) 缓存，训练时尺寸固定只算一次
-                r = rope2d(hz, wz, z.shape[1] // self.blocks[0].h, z.device)
-                if len(self._rcache) > 8:        # 推理 tile 尺寸变化时别无限增长
-                    self._rcache.clear()
-                self._rcache[key] = r
-            t = z.flatten(2).transpose(1, 2)
-            for blk in self.blocks:
-                t = blk(t, r)
-        else:
-            pe = self.pe
-            if pe.shape[-2:] != (hz, wz):        # 推理 tile 尺寸变化时插值位置编码
-                pe = F.interpolate(pe, size=(hz, wz), mode="bilinear", align_corners=False)
-            t = (z + pe).flatten(2).transpose(1, 2)
-            for blk in self.blocks:
-                t = blk(t)
+        key = (hz, wz, z.device)
+        r = self._rcache.get(key)
+        if r is None:                        # 按 (h,w) 缓存，训练时尺寸固定只算一次
+            r = rope2d(hz, wz, z.shape[1] // self.blocks[0].h, z.device)
+            if len(self._rcache) > 8:        # 推理 tile 尺寸变化时别无限增长
+                self._rcache.clear()
+            self._rcache[key] = r
+        t = z.flatten(2).transpose(1, 2)
+        for blk in self.blocks:
+            t = blk(t, r)
         z = self.norm(t).transpose(1, 2).reshape(B, C, hz, wz)
 
         y = self.u1(torch.cat([s2, F.interpolate(z, size=s2.shape[-2:], mode="bilinear",
@@ -219,7 +206,7 @@ class DiTRestore(nn.Module):
 def build_model(arch, ch, base, depth, residual, attn, **kw):
     if arch == "dit":
         return DiTRestore(ch, base, kw.get("dim", 256), kw.get("blocks", 6), kw.get("heads", 8),
-                          residual, rope=kw.get("rope", True))
+                          residual)
     return UNet(ch, base, depth, residual, attn)
 
 
@@ -321,46 +308,6 @@ def ink_metrics(pred, target, inp, tau=0.12, white=0.60, ksize=31) -> dict:
             "ghost": float(g_out), "ghost_keep": float(g_out / g_in)}
 
 
-class PerceptualLoss(nn.Module):
-    """VGG16 中间层特征的 L1 感知损失。
-
-    权重是 torchvision 的 ImageNet 预训练 vgg16，已缓存在
-    ~/.cache/torch/hub/checkpoints/vgg16-397923af.pth，**不需要联网、不新增依赖**
-    （没装 lpips，但 VGG perceptual 用 torchvision 自带实现即可）。
-
-    只取浅层（默认 relu1_2 / relu2_2）：本任务的失效模式是"灰印子"和"细线被冲淡"，
-    都是纹理/边缘层面的事，正是浅层特征敏感的东西；深层语义特征对"白纸上有没有
-    淡灰色笔迹"这种差异反而不敏感，还更贵。
-
-    注意：全程 fp32（外层 RestorationLoss 已关 autocast）。这个项目已经在 bf16
-    精度上栽过一次（见 ssim 的注释），感知特征不再冒这个险。
-    """
-
-    _MEAN = (0.485, 0.456, 0.406)
-    _STD = (0.229, 0.224, 0.225)
-
-    def __init__(self, layers=(3, 8)):
-        super().__init__()
-        from torchvision.models import VGG16_Weights, vgg16
-        net = vgg16(weights=VGG16_Weights.DEFAULT).features
-        self.layers = list(layers)
-        self.net = net[:max(self.layers) + 1].eval()
-        for p in self.net.parameters():
-            p.requires_grad_(False)
-        self.register_buffer("mean", torch.tensor(self._MEAN).view(1, 3, 1, 1), persistent=False)
-        self.register_buffer("std", torch.tensor(self._STD).view(1, 3, 1, 1), persistent=False)
-
-    def forward(self, pred, target):
-        x = (pred.float() - self.mean) / self.std
-        y = (target.float() - self.mean) / self.std
-        loss, n = pred.new_zeros(()), 0
-        for i, m in enumerate(self.net):
-            x, y = m(x), m(y)
-            if i in self.layers:
-                loss, n = loss + F.l1_loss(x, y), n + 1
-        return loss / max(n, 1)
-
-
 class RestorationLoss(nn.Module):
     """L = w_l1·L1 + w_mse·MSE + w_ssim·(1-SSIM) + w_edge·Edge + w_ghost·Ghost + w_hf·HF
 
@@ -389,12 +336,10 @@ class RestorationLoss(nn.Module):
 
     def __init__(self, w_l1=1.0, w_mse=0.0, w_ssim=0.2, w_edge=0.2,
                  mask_weight=0.0, mask_tau=0.12, mask_dilate=7, mask_white=0.60,
-                 w_ghost=0.0, w_hf=0.0, ghost_ksize=31, hf_sigma=3.0, w_vgg=0.0):
+                 w_ghost=0.0, w_hf=0.0, ghost_ksize=31, hf_sigma=3.0):
         super().__init__()
         self.w = dict(l1=w_l1, mse=w_mse, ssim=w_ssim, edge=w_edge,
-                      ghost=w_ghost, hf=w_hf, vgg=w_vgg)
-        # w_vgg=0 时不构造 VGG（省掉 528MB 权重加载的十几秒启动开销）
-        self.vgg = PerceptualLoss() if w_vgg > 0 else None
+                      ghost=w_ghost, hf=w_hf)
         self.mask_weight, self.mask_tau, self.mask_dilate = mask_weight, mask_tau, mask_dilate
         self.mask_white = mask_white
         self.ghost_ksize, self.hf_sigma = ghost_ksize, hf_sigma
@@ -447,16 +392,11 @@ class RestorationLoss(nn.Module):
                 hi = lambda t: t.mean(1, keepdim=True) - _gauss_blur(t.mean(1, keepdim=True), self.hf_sigma)
                 hf = (hi(pred) - hi(target)).abs().mean()
 
-            vgg = pred.new_zeros(())
-            if self.w["vgg"] > 0 and self.vgg is not None:
-                vgg = self.vgg(pred, target)
-
             total = (self.w["l1"] * l1 + self.w["mse"] * mse + self.w["ssim"] * sl
                      + self.w["edge"] * el
-                     + self.w["ghost"] * self.ghost_scale * ghost + self.w["hf"] * hf
-                     + self.w["vgg"] * vgg)
+                     + self.w["ghost"] * self.ghost_scale * ghost + self.w["hf"] * hf)
         parts = dict(l1=l1.detach(), mse=mse.detach(), ssim_loss=sl.detach(),
-                     edge=el.detach(), ghost=ghost.detach(), hf=hf.detach(), vgg=vgg.detach())
+                     edge=el.detach(), ghost=ghost.detach(), hf=hf.detach())
         return {"total": total, **parts}
 
 
@@ -571,10 +511,8 @@ if __name__ == "__main__":
     for shp in [(2, 3, 256, 256), (1, 3, 512, 512), (1, 3, 251, 373)]:
         d = DiTRestore(base=16, dim=64, blocks=2, heads=8)
         assert d(torch.randn(*shp)).shape == shp, f"DiT+RoPE 前向失败 {shp}"
-    d = DiTRestore(base=16, dim=64, blocks=2, heads=8, rope=False)
-    assert d(torch.randn(1, 3, 256, 256)).shape == (1, 3, 256, 256)
-    assert "pe" not in dict(DiTRestore(base=16, dim=64, blocks=2).named_parameters()), \
-        "RoPE 模式下不应再有位置编码参数表"
+    assert not [n for n, _ in DiTRestore(base=16, dim=64, blocks=2).named_parameters()
+                if "pe" in n], "不应再有位置编码参数表"
     # RoPE 的核心性质：旋转角只由坐标决定。4x4 网格的 token#4 与 8x8 网格的 token#8
     # 都是 (row=1, col=0)，必须得到完全相同的角度 —— 这就是换分辨率不用插值的根据。
     r4, r8 = rope2d(4, 4, 32, "cpu"), rope2d(8, 8, 32, "cpu")
